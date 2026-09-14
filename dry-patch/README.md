@@ -226,6 +226,13 @@ numbers are given as orders of magnitude rather than as guarantees.
   covered only by unit tests of the state object, not end to end.
 - **No long-context or long-generation run.** 64 tokens per prompt is short for a loop-avoidance
   feature; the thing DRY exists to prevent mostly happens later than that.
+- **End-to-end throughput with DRY enabled has not been measured.** The costs in the section above
+  are per-call and per-step figures, not serving throughput, and it would be a mistake to read one as
+  the other. Three attempts on the available hardware produced a run-to-run spread far larger than
+  the effect being looked for, so no number is offered. Worth knowing what little those attempts did
+  show: with DRY on, throughput came out lower in every row of the two attempts that were not
+  outright broken, so the cost is likely real even though its size is not established here. Measure
+  it on your own hardware before enabling DRY on a throughput-sensitive deployment.
 - **No accelerator other than CUDA, and one card only.**
 - **Nothing was run with CUDA graphs or `torch.compile`.** Every end-to-end arm used
   `enforce_eager=True`, and the unit tests call `apply_dry` directly. A real server runs with graphs
