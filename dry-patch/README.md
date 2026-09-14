@@ -57,7 +57,7 @@ curl localhost:8000/v1/completions -H 'Content-Type: application/json' -d '{
 | parameter | default here | meaning |
 |---|---|---|
 | `dry_multiplier` | `0.0` | Penalty multiplier. `0.0` disables DRY entirely. `0.8` is a typical enabled value. |
-| `dry_base` | `1.75` | Exponential base. Below `1.0` disables, as in llama.cpp. |
+| `dry_base` | `1.75` | Exponential base. Below `1.0` disables DRY, as in llama.cpp's sampler; note llama-server instead substitutes its own default. |
 | `dry_allowed_length` | `2` | Repetitions up to this length are not penalised. Bounded to `[0, 2147483647]`. |
 | `dry_penalty_last_n` | `-1` | Context scanned for repetitions. `-1` scans everything, `0` disables, otherwise `[1, 2147483647]`. **This default differs from llama.cpp**, see below. |
 | `dry_sequence_breakers` | `["\n", ":", "\"", "*"]` | Strings that interrupt sequence matching, so repetition is not tracked across lines or chat turns. Any vocabulary token whose text *contains* one of these acts as a breaker, following llama.cpp. At most 64 entries (`MAX_DRY_SEQUENCE_BREAKERS`, a rejection; llama.cpp has no such cap), each truncated to 40 code points (`dry_utils.py:_MAX_BREAKER_CHAR_LEN`) where llama.cpp truncates to 40 bytes - identical for ASCII breakers, not for others. |
@@ -66,8 +66,13 @@ curl localhost:8000/v1/completions -H 'Content-Type: application/json' -d '{
 `dry_sequence_breakers` match `common/common.h` exactly. `dry_penalty_last_n` does not: llama.cpp
 defaults it to **64** and rejects negative values outright (`common/arg.cpp`, "error: invalid
 dry-penalty-last-n"), whereas the default here is `-1`, meaning scan the whole context. So a config
-carried over from llama.cpp without setting this field gets a whole-context scan, which costs more and
-penalises differently. Set it to `64` to match llama.cpp's behaviour.
+carried over from llama.cpp without setting that field gets a whole-context scan, which costs more and
+penalises differently. Set `dry_penalty_last_n` to `64` to match llama.cpp's behaviour.
+
+Three validation rules also differ from llama-**server** specifically. It replaces a `dry_base` below
+1.0 with its configured default, so DRY still runs, where here a sub-1.0 base leaves DRY inert. It
+rejects an empty `dry_sequence_breakers` array, which here is accepted. And it puts no cap on the
+number of breakers, where here more than 64 is rejected.
 
 ## Removing it
 
@@ -95,7 +100,7 @@ caller that expects DRY then gets unpenalised output with no error. Check your c
   in the sampler instead, but that skip keys on the logits being draft-expanded, which is false on any
   step where no request happens to carry draft tokens, so DRY would have applied on some steps and not
   others, flickering with the schedule.
-- **`dry_base` below 1.0 disables DRY**, as in llama.cpp. It is accepted, and logs a warning *when a
+- **`dry_base` below 1.0 disables DRY**, as in llama.cpp's sampler (llama-server instead replaces it with its configured default, so a config that works there produces no penalty here). It is accepted, and logs a warning *when a
   non-zero `dry_multiplier` is also set*. Note the gap: sending only `{"dry_base": 0.8}`, where
   `dry_multiplier: 0.8` was meant, leaves the multiplier at its 0.0 default, so DRY is off and nothing
   warns - the multiplier being unset is indistinguishable from not wanting DRY.
@@ -193,16 +198,17 @@ so it had been measuring the match scan and never the penalty path it exists to 
 **Do not expose DRY parameters directly to untrusted clients.** With trusted callers the numbers below
 are the cost you are choosing.
 
-All three were measured on one RTX 5050 at vocab 128256 by calling `dry_core` directly, not through a
-serving benchmark, and **no log for them is shipped in this directory** - you would have to re-measure
+The first is extrapolated, not measured; the other two were taken on one RTX 5050 at vocab 128256 by
+calling `dry_core` directly, not through a serving benchmark, and **no log for any of them is shipped
+in this directory** - you would have to re-measure
 to check them. That is weaker provenance than everything in the section above, and it is why the
 numbers are given as orders of magnitude rather than as guarantees.
 
 - **A `dry_base` from `1.0` up to about `1.044` routes to a pure-Python scan.** Those bases push the
   exponent cap past the vectorised path's budget, so the request falls back to a Z-algorithm in Python
-  plus a full `.tolist()` of the window, per request per decode step, holding the GIL. About 23 ms per
-  step at a 64k context, so sixteen such requests cost roughly 0.37 s per decode step for the whole
-  engine. Every input involved is legal, and the window defaults to the whole context.
+  plus a full `.tolist()` of the window, per request per decode step, holding the GIL. On the order of tens of milliseconds per step at a
+  long context: about 23 ms extrapolated from a 2048-token window measurement, not measured at 64k,
+  and the 0.37 s for sixteen concurrent requests scales from that same extrapolation. Every input involved is legal, and the window defaults to the whole context.
 - **Steady-state cost scales with batch and window.** On a 2048-token window at `dry_base=1.75`: about
   6 ms per call at batch 128 and 13 ms at batch 256; a 4000-id breaker set roughly doubles it. Cost is
   linear in `dry_penalty_last_n`, which defaults to the whole context, so set a bound if you serve long
@@ -228,10 +234,12 @@ numbers are given as orders of magnitude rather than as guarantees.
   feature; the thing DRY exists to prevent mostly happens later than that.
 - **End-to-end throughput with DRY enabled has not been measured.** The costs in the section above
   are per-call and per-step figures, not serving throughput, and it would be a mistake to read one as
-  the other. Three attempts on the available hardware produced a run-to-run spread far larger than
-  the effect being looked for, so no number is offered. Worth knowing what little those attempts did
-  show: with DRY on, throughput came out lower in every row of the two attempts that were not
-  outright broken, so the cost is likely real even though its size is not established here. Measure
+  the other. Three attempts on the available hardware failed to resolve it: the first was
+  invalid (prefix caching left on with identical prompts), and the other two produced a run-to-run
+  spread far larger than the effect. No number is offered. With DRY on, throughput came out lower in every row of the
+  two attempts that were not outright broken, but every repetition ran DRY-off first and DRY-on
+  second, so a within-pair clock or thermal drift on a card that idles at 225 MHz would produce the
+  same pattern. Treat the direction as unconfirmed, not just the magnitude. Measure
   it on your own hardware before enabling DRY on a throughput-sensitive deployment.
 - **No accelerator other than CUDA, and one card only.**
 - **Nothing was run with CUDA graphs or `torch.compile`.** Every end-to-end arm used
@@ -261,10 +269,10 @@ pytest tests/v1/sample/test_dry.py      # about eight seconds
 ## Status upstream
 
 There is an open pull request, [#50584](https://github.com/vllm-project/vllm/pull/50584), for DRY in
-vLLM under the same authorship, but **it is not this code**: its head is `0a35713770` from 2026-08-05,
-it carries a second implementation for the V1 model runner in `vllm/v1/sample/logits_processor/`, and
-it is currently conflicting with `main`. This patch is the later single-implementation rewrite against
-the V2 runner. Do not read the PR diff expecting to see what you are applying.
+vLLM under the same authorship, and it carries this implementation. The DRY sources are identical; the
+two differ only in base commit, since the PR is rebased onto a newer `main` while this patch stays
+pinned to `410f6da5c4` and does not track it. The PR previously carried an older version with a second
+implementation for the V1 model runner; that is gone.
 
 The feature request, [#8581](https://github.com/vllm-project/vllm/issues/8581), has been open since
 2024-09-18 with 23 thumbs-up and 31 comments, none of them from a vLLM maintainer. #50584 has had no

@@ -2,18 +2,18 @@
 
 TWO COSTS, and they are not the same question.
 
-  patched/off vs pristine   what everyone pays for the patch existing. This one has to be ~0 or the
-                            change is not mergeable at any acceptance rate.
-  patched/on vs patched/off what a user opts into by enabling DRY. The number on record for a
-                            different implementation (aphrodite, 2024-12) is a 5-10% batched
-                            regression; this measures ours.
+THIS MEASURES ONE COST ONLY: DRY on against DRY off, within a single patched build, which is what a
+user opts into by enabling the feature. It does NOT measure what the patch costs when DRY is unused -
+that needs a pristine build, which this script cannot load, because SamplingParams would reject the
+dry_* fields. Do not read the "off" column as "unpatched".
 
 FAIR COMPARISON, deliberately. ignore_eos=True with a fixed max_tokens so both arms emit exactly the
 same token count: with EOS live, DRY changes which tokens are produced and therefore when the
 sequence stops, and a throughput ratio would silently be comparing different amounts of work.
 
-A warm-up generation is discarded before every measured arm. A cold first run on this rig has
-already produced a wrong answer once today, in the opt-out harness.
+Three warm-up pairs are discarded before each batch's measured repetitions. A cold first run on this
+rig has already produced a wrong answer once, in the opt-out harness, and this card idles at 225 MHz
+against a 3135 MHz ceiling.
 
     python throughput.py --batches 1,8,32 --reps 3
 """
@@ -75,7 +75,7 @@ def main():
         dt = time.perf_counter() - t
         n = sum(len(r.outputs[0].token_ids) for r in res)
         assert n == batch * args.max_tokens, f"expected {batch * args.max_tokens} tokens, got {n}"
-        return n / dt, list(res[0].outputs[0].token_ids)
+        return n / dt, [list(r.outputs[0].token_ids) for r in res]
 
     rows = []
     print(f"  {name}, {args.model}, prompt {args.prompt_tokens}, gen {args.max_tokens}, "
@@ -97,15 +97,24 @@ def main():
             n_, tok_on = run(b, True)
             offs.append(o); ons.append(n_)
         off, on = statistics.median(offs), statistics.median(ons)
-        spread = max(max(offs) - min(offs), max(ons) - min(ons)) / off * 100
+        # Each arm's range against ITS OWN median. Normalising both by the off-arm median
+        # understated the on-arm spread and made this guard fire less often than it should.
+        spread = 100 * max((max(offs) - min(offs)) / off, (max(ons) - min(ons)) / on)
         # DRY must actually have changed the output, or the delta is the cost of a code path that
         # did nothing and the comparison is worthless. An earlier draft of this check compared a
         # list against None, which is true unconditionally and would have certified anything.
-        changed = tok_off != tok_on
+        # EVERY slot, not just the first. Checking res[0] alone certified a batch-32 row from one
+        # prompt, which is the same shape of error as the `list(...) != None` guard this replaced.
+        n_changed = sum(1 for x, y in zip(tok_off, tok_on) if x != y)
+        changed = n_changed == len(tok_off)
         delta = 100.0 * (on - off) / off
         rows.append({"batch": b, "off_tok_s": off, "on_tok_s": on, "delta_pct": delta,
                      "off_all": offs, "on_all": ons, "spread_pct": spread,
-                     "dry_changed_output": changed})
+                     "dry_changed_output": changed,
+                     # Recorded, not merely printed: every row this script has ever produced was
+                     # noise-dominated, and a consumer reading delta_pct out of the JSON had no way
+                     # to know that.
+                     "noise_dominated": spread > abs(delta)})
         print(f"  {b:>6} {off:>11.1f} {on:>10.1f} {delta:>7.1f}%  {spread:>7.1f}%  "
               f"{'yes' if changed else 'NO':>8}")
         if spread > abs(delta):
@@ -113,9 +122,9 @@ def main():
                   f"({abs(delta):.1f}%); this row is noise, not a measurement")
         if not changed:
             raise SystemExit(
-                f"  !! at batch {b} the output is identical with DRY on and off, so this row "
-                f"measures a penalty path that never charged anything. Use a more repetitive "
-                f"prompt or a longer generation."
+                f"  !! at batch {b} only {n_changed}/{len(tok_off)} prompts changed with DRY on, "
+                f"so this row times a penalty path that did not charge on every slot. Use a more "
+                f"repetitive prompt or a longer generation."
             )
 
     if args.out:
