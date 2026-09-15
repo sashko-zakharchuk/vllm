@@ -109,9 +109,11 @@ caller that expects DRY then gets unpenalised output with no error. Check your c
 
 ## What has been verified, and under exactly what conditions
 
-**The included suite is 32 passed in about 8 s** on an RTX 5050 at this patch's own base, and
-`ruff check` and `ruff format --diff` are clean on all nine files. That run matters because upstream
-moved 319 commits between the 2026-09-06 revision this code was last verified against and the
+**The included suite is 32 passed** on an RTX 5050, and `ruff check` and `ruff format --diff` are
+clean on all nine files. The retained log for that suite run is from a tree 70 commits past this
+patch's pinned base, on byte-identical DRY sources; the ruff run has no retained log at all. Run
+both yourself in ten seconds, which is the point of shipping the suite. It matters because upstream
+moved 327 commits between the 2026-09-06 revision this code was last verified against and the
 pinned base. (Against the revision it was *first* written on, 2026-07-31, the drift is 1866.)
 
 **Applying it does not change output for a request that does not enable DRY**, measured end to end
@@ -155,8 +157,9 @@ identical. Reproduce with `verify/opt-out-e2e.sh`, noting its requirements below
 
 **A two-arm control over eight upstream sampler suites** shows the patch adds no failure:
 43 failed / 276 passed / 3 skipped on the patched tree and *the same 43 tests* on pristine
-`410f6da5c4`, and identically again on two further pairs of runs, one with `scipy`
-installed and `TORCH_CUDA_ARCH_LIST` set and one at the shipped code. 34 of the 43 are in `test_topk_topp_sampler.py`, which the patch does not
+`410f6da5c4`, and identically again on two further pairs of runs, both of them with `scipy`
+installed and `TORCH_CUDA_ARCH_LIST` set. All three pairs are earlier revisions of this work, not
+the shipped bytes. 34 of the 43 are in `test_topk_topp_sampler.py`, which the patch does not
 touch. We deliberately do not explain why those 43 fail: two attempts at an explanation were wrong,
 and neither setting `TORCH_CUDA_ARCH_LIST` nor installing the missing `scipy` changed the count. The
 control's job is only to show the same tests fail with and without the patch. You will likely see a
@@ -210,9 +213,10 @@ numbers are given as orders of magnitude rather than as guarantees.
   long context: about 23 ms extrapolated from a 2048-token window measurement, not measured at 64k,
   and the 0.37 s for sixteen concurrent requests scales from that same extrapolation. Every input involved is legal, and the window defaults to the whole context.
 - **Steady-state cost scales with batch and window.** On a 2048-token window at `dry_base=1.75`: about
-  6 ms per call at batch 128 and 13 ms at batch 256; a 4000-id breaker set roughly doubles it. Cost is
-  linear in `dry_penalty_last_n`, which defaults to the whole context, so set a bound if you serve long
-  ones.
+  6.4 ms per call at batch 128 and 12.2 ms at batch 256; llama.cpp's default breaker set (~3900 ids
+  on a Llama-3 tokenizer) adds about half again at batch 256, measured on a later revision of this
+  work with the same per-row indexing rather than on the patch itself. Cost is linear in
+  `dry_penalty_last_n`, which defaults to the whole context, so set a bound if you serve long ones.
 - **The first request against a tokenizer pays a one-off vocabulary decode.** Resolving sequence
   breakers to token ids decodes every vocabulary entry once, synchronously on the API server's event
   loop: about 220 ms on a 50k-token vocabulary, more on a larger one. The decoded texts are then cached
@@ -269,16 +273,30 @@ pytest tests/v1/sample/test_dry.py      # about eight seconds
 ## Status upstream
 
 There is an open pull request, [#50584](https://github.com/vllm-project/vllm/pull/50584), for DRY in
-vLLM under the same authorship, and it carries this implementation. The DRY sources are identical; the
-two differ only in base commit, since the PR is rebased onto a newer `main` while this patch stays
-pinned to `410f6da5c4` and does not track it. The PR previously carried an older version with a second
-implementation for the V1 model runner; that is gone.
+vLLM under the same authorship. This patch is a snapshot of it, pinned to `410f6da5c4`, and it does
+not track the PR. **The PR has since moved ahead of this patch.** Its sampler path no longer
+synchronises the GPU with the host on every step, and it asserts the preconditions its penalty
+reduction depends on, and it stacks the breaker masks instead of indexing them per row. The
+penalties come out the same: `dry_core` on this patch and on the PR head was run on eight identical
+inputs, at vocab 4096 with `dry_base` 1.75 and `dry_allowed_length` 2, five without breakers and
+three with, and returned bit-identical logits on every one. That is the core only, not the sampler
+around it, and eight fixed shapes rather than a sweep.
+
+What that comparison does not show is the cost, and it is not all in one direction. Peak memory over
+the penalty path rises from 71 to 79 MiB at batch 32 and from 164 to 259 MiB at batch 384, because
+the accumulator became float32 penalties where it was int16 match lengths; a request whose context
+never repeats lost its early-out; and without breakers the step is a few percent slower at batch 128
+and 256, that pair measured on the PR head against the revision before the sync work. With breakers,
+which is almost every real request, the PR's stacked masks are about a quarter faster than the
+per-row indexing this patch keeps: 14.18 against 19.02 ms at batch 256, at vocab 128256 and a
+2048-token window. That was measured between two PR revisions and does not include the slowdown
+above at that batch; netting the two works out nearer a fifth than a quarter.
+If you want the newer code, take it from the PR branch.
 
 The feature request, [#8581](https://github.com/vllm-project/vllm/issues/8581), has been open since
-2024-09-18 with 23 thumbs-up and 31 comments, none of them from a vLLM maintainer. #50584 has had no
-human review. This patch exists because that is a poor reason for users to go without the feature, not
-as a complaint: vLLM has over five thousand open pull requests and maintainer attention is the scarce
-resource.
+2024-09-18 with 23 thumbs-up and 32 comments, none of them from a vLLM maintainer. #50584 has had one
+maintainer question, on 2026-09-15, and no review of the code. vLLM has over five thousand open pull
+requests.
 
 DRY from the same effort is upstream and **merged** in exllamav3 as
 [SS_DRY](https://github.com/turboderp-org/exllamav3/pull/278) (a different codebase and a separate
